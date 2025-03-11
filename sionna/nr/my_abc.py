@@ -321,7 +321,7 @@ class MySimulator():
         self.Resource_Grid_Mapper._resource_grid.pilot_pattern.pilots = pilots
         """Channel Estimationand Detection will reflect this update since they reference the same object."""
 
-    def sim(self, batch_size, channel_model, no_scaling, gen_prng_seq=None, return_channel=False):
+    def sim(self, batch_size, channel_model, no_scaling, gen_prng_seq=None, return_tx_iq=False, return_channel=False):
         if gen_prng_seq:
             b = tf.reshape(tf.constant(generate_prng_seq(batch_size * self.Num_tx * self.tb_size, gen_prng_seq), dtype=tf.float32), [batch_size, self.Num_tx, self.tb_size])
         else:
@@ -338,16 +338,16 @@ class MySimulator():
         y = self.AWGN([y, no])
 
         if return_channel:
-            if gen_prng_seq:
+            if return_tx_iq:
                 return b, c, y, x, h
             return b, c, y, h
         
-        if gen_prng_seq:
+        if return_tx_iq:
             return b, c, y, x
         return b, c, y
         
     
-    def rec(self, y, no_ = 1e-10):
+    def rec(self, y, no_ = 1e-3):
         h_hat, err_var = self.Channel_Estimator([y, no_])
         llr_det = self.Mimo_Detector([y, h_hat, err_var, no_])
         llr_layer = self.Layer_Demapper(llr_det)
@@ -721,8 +721,8 @@ class CustomNeuralReceiver(tf.keras.Model):
                 padded_input_size = inputs.shape[1] + padding_size
                 inputs = tf.concat([inputs, inputs[:,:padding_size,]],axis=1)
                 inputs = tf.reshape(inputs, [-1,48,14,16])
-
-        z = self._input_conv(inputs)
+        z = tf.linalg.l2_normalize(inputs, axis=[-1,-2,-3])
+        z = self._input_conv(z)
         # Residual blocks
         z = self._res_block_1(z)
         z = self._res_block_2(z)
