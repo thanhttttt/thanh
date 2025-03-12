@@ -11,6 +11,7 @@ from sionna.channel.tr38901 import Antenna, AntennaArray, UMi, UMa, RMa, TDL, CD
 from tqdm import tqdm
 import random
 
+import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
 import tensorflow as tf
@@ -387,8 +388,7 @@ class MySimulator():
 
         return h_hat, x_hat, llr_det, b_hat, tb_crc_status
     
-    def per(self, y, h, snr):
-        no = tf.math.reduce_variance(y, axis=[-1,-2,-3,-4])/(snr + 1)
+    def per(self, y, h, no):
         h_hat, err_var = h, 0.
         x_hat = self.Equalizer([y, h_hat, err_var, no])
         llr_det = self.Mimo_Detector([y, h_hat, err_var, no])
@@ -590,111 +590,6 @@ def generate_data(name: str,
     return df
 
 
-# class ResidualBlock(tf.keras.Model):
-#     r"""
-#     This Keras layer implements a convolutional residual block made of two convolutional layers with ReLU activation, layer normalization, and a skip connection.
-#     The number of convolutional channels of the input must match the number of kernel of the convolutional layers ``num_conv_channel`` for the skip connection to work.
-
-#     Input
-#     ------
-#     : [batch size, num time samples, num subcarriers, num_conv_channel], tf.float
-#         Input of the layer
-
-#     Output
-#     -------
-#     : [batch size, num time samples, num subcarriers, num_conv_channel], tf.float
-#         Output of the layer
-#     """
-
-#     def build(self, input_shape):
-
-#         # Layer normalization is done over the last three dimensions: time, frequency, conv 'channels'
-#         self._layer_norm_1 = LayerNormalization(axis=(-1, -2, -3))
-#         self._conv_1 = SeparableConv2D(filters= 64,
-#                               kernel_size=[3,3],
-#                               padding='same',
-#                               activation=None)
-#         # Layer normalization is done over the last three dimensions: time, frequency, conv 'channels'
-#         self._layer_norm_2 = LayerNormalization(axis=(-1, -2, -3))
-#         self._conv_2 = SeparableConv2D(filters= 128,
-#                               kernel_size=[3,3],
-#                               padding='same',
-#                               activation=None)
-
-#     def call(self, inputs):
-#         z = self._layer_norm_1(inputs)
-#         z = relu(z)
-#         z = self._conv_1(z)
-#         z = self._layer_norm_2(z)
-#         z = relu(z)
-#         z = self._conv_2(z) # [batch size, num time samples, num subcarriers, num_channels]
-#         # Skip connection
-#         z = z + inputs
-
-#         return z
-
-# class CustomNeuralReceiver(tf.keras.Model):
-#     r"""
-#     Keras layer implementing a residual convolutional neural receiver.
-
-#     This neural receiver is fed with the post-DFT received samples, forming a resource grid of size num_of_symbols x fft_size, and computes LLRs on the transmitted coded bits.
-#     These LLRs can then be fed to an outer decoder to reconstruct the information bits.
-
-#     Input
-#     ------
-#     y_no: [batch size, num ofdm symbols, num subcarriers, 2*num rx antenna + 1], tf.float32
-#         Concatenated received samples and noise variance.
-# (
-#     y : [batch size, num rx antenna, num ofdm symbols, num subcarriers], tf.complex
-#         Received post-DFT samples.
-
-#     no : [batch size], tf.float32
-#         Noise variance. At training, a different noise variance value is sampled for each batch example.
-# )
-#     Output
-#     -------
-#     : [batch size, num ofdm symbols, num subcarriers, num_bits_per_symbol]
-#         LLRs on the transmitted bits.
-#     """
-
-#     def __init__(self, training = False):
-#         super(CustomNeuralReceiver, self).__init__()
-#         self._training = training
-
-#     def build(self, input_shape):
-
-#         # Input convolution
-#         self._input_conv = Conv2D(filters= 128,
-#                                   kernel_size=[3,3],
-#                                   padding='same',
-#                                   activation=None)
-#         # Residual blocks
-#         self._res_block_1 = ResidualBlock()
-#         self._res_block_2 = ResidualBlock()
-#         self._res_block_3 = ResidualBlock()
-#         self._res_block_4 = ResidualBlock()
-#         # Output conv
-#         self._output_conv = Conv2D(filters= 2,    # QPSK
-#                                    kernel_size=[3,3],
-#                                    padding='same',
-#                                    activation=None)
-        
-
-#     @tf.function(jit_compile=True)
-#     def call(self, inputs):
-#         # Input conv
-#         z = self._input_conv(inputs)
-#         # Residual blocks
-#         z = self._res_block_1(z)
-#         z = self._res_block_2(z)
-#         z = self._res_block_3(z)
-#         z = self._res_block_4(z)
-#         # Output conv
-#         z = self._output_conv(z)
-#         # if self._training == False:
-#         #     z = tf.cast(z * (2**7), tf.int8)
-#         return z
-    
 
 def load_weights(model, pretrained_weights_path):
     # Build Model with random input
@@ -944,7 +839,7 @@ class CustomNeuralReceiver(tf.keras.Model):
                 padded_input_size = padded_input_size + padding_size
                 inputs = tf.concat([inputs, inputs[:,:padding_size,]],axis=1)
             inputs = tf.reshape(inputs, [-1,48,14,18])
-        # z = tf.linalg.l2_normalize(inputs, axis=[-1,-2,-3])
+
         z = inputs
         z = self._input_conv(z)
         # Residual blocks
@@ -963,7 +858,7 @@ class CustomNeuralReceiver(tf.keras.Model):
 
         z = tf.concat([z[...,0:3,:],z[...,4:11,:], z[...,12:14,:]],axis=-2)
         z = tf.transpose(z, perm=[0,2,1,3])
-        z = tf.reshape(z, [z.shape[0],(z.shape[1]*z.shape[2]*z.shape[3])])
+        z = tf.reshape(z, [-1,(z.shape[1]*z.shape[2]*z.shape[3])])
         return z
 
 
