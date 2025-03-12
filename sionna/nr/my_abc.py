@@ -2,32 +2,63 @@ from dataclasses import dataclass, field
 from typing import List
 from sionna.nr.utils import generate_prng_seq
 from sionna.nr import PUSCHConfig, CarrierConfig, PUSCHDMRSConfig, TBConfig, PUSCHPilotPattern, TBEncoder,LayerMapper, LayerDemapper, TBDecoder, PUSCHLSChannelEstimator
-from sionna.channel import AWGN, OFDMChannel
+from sionna.channel import AWGN, OFDMChannel, gen_single_sector_topology as gen_topology
 from sionna.ofdm import LinearDetector, ResourceGrid, ResourceGridMapper
 from sionna.mimo import StreamManagement
 from sionna.mapping import Mapper
 from sionna.utils import BinarySource
+from sionna.channel.tr38901 import Antenna, AntennaArray, UMi, UMa, RMa, TDL, CDL
+from tqdm import tqdm
+import random
 
+import pandas as pd
+from datetime import datetime
 import tensorflow as tf
 import numpy as np
 import pickle
 import h5py
+import os
+import time
+import struct
 
 from tensorflow.keras.layers import Layer, Conv2D, LayerNormalization, SeparableConv2D
 from tensorflow.nn import relu
 
 from collections import namedtuple
 
+
+CARRIER_FREQUENCY = 2.55e9
+BANDWIDTH = 60
+NUM_RX = 1
+NUM_TX = 1
+NUM_RX_ANT = 8
+NUM_TX_ANT = 1
+NUM_STREAMS_PER_TX = 1
+
+
+Ue_Antenna = Antenna(polarization="single",
+                polarization_type="V",
+                antenna_pattern="38.901",
+                carrier_frequency=CARRIER_FREQUENCY)
+
+Gnb_AntennaArray = AntennaArray(num_rows=1,
+                        num_cols=NUM_RX_ANT//2,
+                        polarization="dual",
+                        polarization_type="cross",
+                        antenna_pattern="38.901",
+                        carrier_frequency=CARRIER_FREQUENCY)
+
+
 @dataclass
 class SystemConfig:
     NCellId: int = 246
     FrequencyRange: int = 1
-    BandWidth: int = 100
+    BandWidth: int = BANDWIDTH
     Numerology: int = 1
     CpType: int = 0
-    NTxAnt: int = 1
-    NRxAnt: int = 8
-    BwpNRb: int = 273
+    NTxAnt: int = NUM_TX_ANT
+    NRxAnt: int = NUM_RX_ANT
+    BwpNRb: int = 162
     BwpRbOffset: int = 0
     harqProcFlag: int = 0
     nHarqProc: int = 1
@@ -78,9 +109,7 @@ class UeConfig:
 class MyConfig:
     Sys: SystemConfig
     Ue: List[UeConfig]
-    Num_tx: int = 1
-    Num_rx: int = 1
-    Carrier_frequency: float = 2.55e9  # Carrier frequency in Hz
+    Carrier_frequency: float = CARRIER_FREQUENCY  # Carrier frequency in Hz
 
 class MyPUSCHConfig(PUSCHConfig):
     def __init__(self, My_Config: MyConfig, slot_number=4, frame_number=0):
@@ -102,7 +131,7 @@ class MyPUSCHConfig(PUSCHConfig):
                 length=My_Config.Ue[0].DmrsDuration,
                 additional_position=My_Config.Ue[0].DmrsAdditionalPosition,
                 dmrs_port_set=My_Config.Ue[0].DmrsPortSetIdx,
-                n_id=My_Config.Ue[0].NnScIdId,
+                n_id=[My_Config.Ue[0].NnScIdId,My_Config.Ue[0].NnScIdId],
                 n_scid=My_Config.Ue[0].nScId,
                 num_cdm_groups_without_data=My_Config.Ue[0].NumDmrsCdmGroupsWithoutData,
                 type_a_position=My_Config.Ue[0].DmrsTypeAPosition
@@ -133,7 +162,7 @@ class MyPUSCHConfig(PUSCHConfig):
     def phy_cell_id(self, value):
         self.carrier._n_cell_id = value
         self.tb._n_id = value
-        self.dmrs._n_id = value
+        self.dmrs._n_id = [value, value]
 
     @property
     def first_resource_block(self):
@@ -240,9 +269,6 @@ class MyPUSCHConfig(PUSCHConfig):
 class MySimulator():
     def __init__(self, pusch_config: MyPUSCHConfig):
 
-        self.Num_rx = pusch_config.My_Config.Num_rx
-        self.Num_tx = pusch_config.My_Config.Num_tx
-    
         tb_size = pusch_config.tb_size
         num_coded_bits = pusch_config.num_coded_bits
         target_coderate = pusch_config.tb.target_coderate
@@ -282,8 +308,8 @@ class MySimulator():
             num_ofdm_symbols=14,
             fft_size=fft_size,
             subcarrier_spacing=subcarrier_spacing,
-            num_tx=self.Num_tx,
-            num_streams_per_tx=1,
+            num_tx=NUM_TX,
+            num_streams_per_tx=NUM_STREAMS_PER_TX,
             cyclic_prefix_length=cp_length,
             num_guard_carriers=guard_subcarriers,
             dc_null=False,
@@ -304,11 +330,13 @@ class MySimulator():
                         interpolation_type='nn',
                         dtype=tf.complex64)
 
-        rxtx_association = np.ones([self.Num_rx, self.Num_tx], bool)
+        rxtx_association = np.ones([NUM_RX, NUM_TX], bool)
         stream_management = StreamManagement(rxtx_association, pusch_config.num_layers)
         self.Mimo_Detector = LinearDetector("lmmse", "bit", "maxlog", resource_grid, stream_management,
                                     "qam", pusch_config.tb.num_bits_per_symbol, dtype=tf.complex64)
         
+        self.Equalizer = LinearDetector("lmmse", "symbol", "maxlog", resource_grid, stream_management,
+                                    "qam", pusch_config.tb.num_bits_per_symbol, dtype=tf.complex64)
 
         self.Layer_Demapper = LayerDemapper(self.Layer_Mapper, num_bits_per_symbol=num_bits_per_symbol)
         self.TB_Decode = TBDecoder(self.TB_Encoder, output_dtype=tf.float32)
@@ -323,9 +351,9 @@ class MySimulator():
 
     def sim(self, batch_size, channel_model, no_scaling, gen_prng_seq=None, return_tx_iq=False, return_channel=False):
         if gen_prng_seq:
-            b = tf.reshape(tf.constant(generate_prng_seq(batch_size * self.Num_tx * self.tb_size, gen_prng_seq), dtype=tf.float32), [batch_size, self.Num_tx, self.tb_size])
+            b = tf.reshape(tf.constant(generate_prng_seq(batch_size * NUM_TX * self.tb_size, gen_prng_seq), dtype=tf.float32), [batch_size, NUM_TX, self.tb_size])
         else:
-            b = self.Binary_Source([batch_size, self.Num_tx, self.tb_size])
+            b = self.Binary_Source([batch_size, NUM_TX, self.tb_size])
 
         c = self.TB_Encoder(b)
         x_map = self.Constellation_Mapper(c)
@@ -333,7 +361,7 @@ class MySimulator():
         x = self.Resource_Grid_Mapper(x_layer)
 
         y, h = channel_model(x)
-        no = no_scaling * tf.math.reduce_variance(y)
+        no = no_scaling * tf.math.reduce_variance(y, axis=[-1,-2,-3,-4])
 
         y = self.AWGN([y, no])
 
@@ -345,27 +373,221 @@ class MySimulator():
         if return_tx_iq:
             return b, c, y, x
         return b, c, y
-        
     
-    def rec(self, y, no_ = 1e-3):
+    def ref(self, batch_size, dtype=tf.complex64):
+        return tf.repeat(tf.transpose(tf.constant(self.pusch_config.dmrs_grid, dtype=dtype), [0, 2, 1])[None, None], repeats=batch_size, axis=0)
+    
+    def rec(self, y, snr_ = 1e3):
+        no_ = tf.math.reduce_variance(y, axis=[-1,-2,-3,-4])/(snr_ + 1)
         h_hat, err_var = self.Channel_Estimator([y, no_])
+        x_hat = self.Equalizer([y, h_hat, err_var, no_])
         llr_det = self.Mimo_Detector([y, h_hat, err_var, no_])
         llr_layer = self.Layer_Demapper(llr_det)
         b_hat, tb_crc_status = self.TB_Decode(llr_layer)
 
-        return h_hat, llr_det, b_hat, tb_crc_status
+        return h_hat, x_hat, llr_det, b_hat, tb_crc_status
     
-    def per(self, y, h, no):
-        no_ = no
+    def per(self, y, h, snr):
+        no = tf.math.reduce_variance(y, axis=[-1,-2,-3,-4])/(snr + 1)
         h_hat, err_var = h, 0.
-        llr_det = self.Mimo_Detector([y, h_hat, err_var, no_])
+        x_hat = self.Equalizer([y, h_hat, err_var, no])
+        llr_det = self.Mimo_Detector([y, h_hat, err_var, no])
         llr_layer = self.Layer_Demapper(llr_det)
         b_hat, tb_crc_status = self.TB_Decode(llr_layer)
 
-        return h_hat, llr_det, b_hat, tb_crc_status
+        return h_hat, x_hat, llr_det, b_hat, tb_crc_status
 
 
+def generate_data(name: str,
+        data_dir: str,
+        pusch_configs: List[MyPUSCHConfig],
+        channel_scenarios: List[str],
+        esno_dbs: List[float],
+        slots: List[int],
+        save_dataset: str = None):
+    assert save_dataset in [None, 'hdf5', 'pickle']
+    """set up save directory"""
+    pusch_records=[]
+    parquet_dir = f'{data_dir}/parquet'
+    if save_dataset: os.makedirs(parquet_dir, exist_ok=True)
+    hdf5_dir = f'{data_dir}/hdf5'
+    if save_dataset == 'hdf5': os.makedirs(hdf5_dir, exist_ok=True)
+    pickle_dir = f'{data_dir}/pickle'
+    if save_dataset == 'pickle': os.makedirs(pickle_dir, exist_ok=True)
 
+    """set up for per slot"""
+    len_per_case = len(slots)
+
+    total_iterations = len(pusch_configs) * len(esno_dbs) * len_per_case
+
+
+    """generate ..."""
+    with tqdm(total=total_iterations, desc="Generating Data") as pbar:
+        for config_idx, pusch_config in enumerate(pusch_configs):
+           
+            Pusch_Pilots = {}
+            Pusch_Slots = set(slots)
+            for n, slot in enumerate(Pusch_Slots):
+                pusch_config_i = pusch_config.clone()
+                pusch_config_i.carrier.slot_number = slot
+                pilot_pattern_i = PUSCHPilotPattern([pusch_config_i], dtype=tf.complex64)
+                Pusch_Pilots[slot] = pilot_pattern_i.pilots
+            len_pusch = len(Pusch_Slots)
+
+            """set up for all case"""
+            carrier_frequency = pusch_config.My_Config.Carrier_frequency
+
+            simulator = MySimulator(pusch_config)
+
+            channel_scenario = random.choice(channel_scenarios)
+            """channel_scenario form: {CDL}-{A|B|C|D|E}-{delay_spread (ns)}-{speed (m/s)}
+                                or {Umi|Uma}-{low|high}-[OnPL]-[OnSF]-{delay_spread (ns)}-{speed (m/s)}
+
+                Ex: CDL-A-150-10"""
+
+            chn_scn = channel_scenario.split('-')
+            
+            model = chn_scn[1]
+            channel = chn_scn[0]
+            enable_pl = True if 'OnPL' in chn_scn else False # Umi/Uma enable pathloss
+            enable_sf = True if 'OnSF' in chn_scn else False # Umi/Uma enable shadow fading
+
+            speed = float(chn_scn[-1])
+            delay_spread = float(chn_scn[-2])
+            
+
+            if 'CDL' == channel:
+                channel_model = CDL(model = model,
+                                        delay_spread = delay_spread*1e-9,
+                                        carrier_frequency = carrier_frequency,
+                                        ut_array = Ue_Antenna,
+                                        bs_array = Gnb_AntennaArray,
+                                        direction = "uplink",
+                                        min_speed = speed,
+                                        max_speed = speed)
+
+            else:
+                if 'Umi' == channel:
+                    channel_model = UMi(carrier_frequency = carrier_frequency,
+                                        o2i_model = model,
+                                        ut_array = Ue_Antenna,
+                                        bs_array = Gnb_AntennaArray,
+                                        direction = "uplink",
+                                        enable_pathloss = enable_pl,
+                                        enable_shadow_fading = enable_sf)
+                elif 'Uma' == channel:
+                    channel_model = UMa(carrier_frequency = carrier_frequency,
+                                        o2i_model = model,
+                                        ut_array = Ue_Antenna,
+                                        bs_array = Gnb_AntennaArray,
+                                        direction = "uplink",
+                                        enable_pathloss = enable_pl,
+                                        enable_shadow_fading = enable_sf)
+
+            simulator = MySimulator(pusch_config)
+
+            channel_i = OFDMChannel(channel_model=channel_model, resource_grid=simulator.resource_grid,
+                                    add_awgn=False, normalize_channel=True, return_channel=True)
+            
+            for esno_db in esno_dbs:
+                no_scaling = pow(10., -esno_db / 10.)
+                if channel in ['Umi', 'Uma']:
+                    channel_i._cir_sampler.set_topology(*gen_topology(1,1,channel.lower(),min_ut_velocity=speed, max_ut_velocity=speed))
+
+                for n,slot in enumerate(slots):
+                    status_str = f"(config {config_idx} | channel {channel_scenario} | {esno_db} dB | slot {slot} | Sample: {n+1}/{len_per_case}"
+                    pbar.set_description(status_str)
+                    simulator.pusch_config.carrier.slot_number = slot
+                    simulator.update_pilots(Pusch_Pilots[slot])
+                    
+                    b, c, y= simulator.sim(1, channel_i, no_scaling, return_channel=False)
+
+                    assert b.shape[0] == b.shape[1] == c.shape[0] == c.shape[1] == y.shape[0] == y.shape[1] == 1
+                    b = tf.cast(b, dtype=tf.uint8)[0][0]
+                    c = tf.cast(c, dtype=tf.uint8)[0][0]
+                    r = tf.transpose(tf.constant(simulator.pusch_config.dmrs_grid, dtype=y.dtype), [0, 2, 1])
+                    y =  y[0][0]
+
+                    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+
+                    # print(y, r)
+                    if save_dataset == 'hdf5':
+                        save_hdf5([b,c,y,r], f'{hdf5_dir}/{name}', timestamp)
+                    if save_dataset == 'pickle':
+                        save_pickle([b,c,y,r], f'{pickle_dir}/{name}', timestamp)
+
+                    
+                    
+                    pusch_records.append(PuschRecord(
+                                        nPhyCellId=pusch_config.carrier.n_cell_id,
+                                        nSFN=(n // len_pusch) % 1023,
+                                        nSlot=slot,
+                                        nPDU=1,
+                                        nGroup=1,
+                                        nUlsch=1,
+                                        nUlcch=0,
+                                        nRachPresent=0,
+                                        nRNTI=pusch_config.n_rnti,
+                                        nUEId=0,
+                                        nBWPSize=pusch_config.n_size_bwp,
+                                        nBWPStart=pusch_config.n_start_bwp,
+                                        nSubcSpacing=pusch_config.carrier.mu,
+                                        nCpType=pusch_config.My_Config.Sys.CpType,
+                                        nULType=0,
+                                        nMcsTable=pusch_config.tb.mcs_table - 1,
+                                        nMCS=pusch_config.tb.mcs_index,
+                                        nTransPrecode=pusch_config.My_Config.Ue[0].TransformPrecoding,
+                                        nTransmissionScheme=pusch_config.My_Config.Ue[0].CodeBookBased,
+                                        nNrOfLayers=pusch_config.num_layers,
+                                        nPortIndex=pusch_config.dmrs.dmrs_port_set,
+                                        nNid=pusch_config.tb.n_id,
+                                        nSCID=pusch_config.dmrs.n_scid,
+                                        nNIDnSCID=pusch_config.dmrs.n_id[0],
+                                        nNrOfAntennaPorts=pusch_config.My_Config.Sys.NRxAnt,
+                                        nVRBtoPRB=0,
+                                        nPMI=pusch_config.My_Config.Ue[0].Tpmi,
+                                        nStartSymbolIndex=pusch_config.symbol_allocation[0],
+                                        nNrOfSymbols=pusch_config.symbol_allocation[1],
+                                        nResourceAllocType=1,
+                                        nDMRSTypeAPos=pusch_config.dmrs.type_a_position,
+                                        nRBStart=pusch_config.first_resource_block,
+                                        nRBSize=pusch_config.num_resource_blocks,
+                                        nTBSize=(pusch_config.tb_size//8),
+                                        nRV=pusch_config.My_Config.Sys.rvSeq,
+                                        nHARQID=n % 16,
+                                        nNDI=1,
+                                        nMappingType=pusch_config.My_Config.Ue[0].PuschMappingType,
+                                        nDMRSConfigType=pusch_config.My_Config.Ue[0].DmrsConfigurationType,
+                                        nNrOfCDMs=pusch_config.dmrs.num_cdm_groups_without_data,
+                                        nNrOfDMRSSymbols=pusch_config.dmrs.length,
+                                        nDMRSAddPos=pusch_config.dmrs.additional_position,
+                                        nPTRSPresent=pusch_config.My_Config.Ue[0].Ptrs,
+                                        nAck=pusch_config.My_Config.Ue[0].OAck,
+                                        nAlphaScaling=pusch_config.My_Config.Ue[0].ScalingFactor,
+                                        nBetaOffsetACKIndex=pusch_config.My_Config.Ue[0].IHarqAckOffset,
+                                        nCsiPart1=pusch_config.My_Config.Ue[0].OCsi1,
+                                        nBetaOffsetCsiPart1Index=pusch_config.My_Config.Ue[0].ICsi1Offset,
+                                        nCsiPart2=pusch_config.My_Config.Ue[0].OCsi2,
+                                        nBetaOffsetCsiPart2Index=pusch_config.My_Config.Ue[0].ICsi2Offset,
+                                        nTpPi2BPSK=pusch_config.My_Config.Ue[0].TpPi2Bpsk,
+                                        nTPPuschID=pusch_config.My_Config.Ue[0].NRsId,
+                                        nRxRUIdx=np.arange(0, pusch_config.My_Config.Sys.NRxAnt),
+                                        nUE=1,
+                                        nPduIdx=[0],
+                                        Channel_model=f"{channel}-{model}",
+                                        Speed=speed,
+                                        Delay_spread=delay_spread,
+                                        Esno_db=esno_db,
+                                        Data_filename=timestamp,
+                                        Data_dirname=name
+                                    )
+                                )
+                    pbar.update(1)  # Increment progress
+
+            df = pd.DataFrame.from_records(pusch_records, columns=PuschRecord._fields)
+            if save_dataset: df.to_parquet(f'{parquet_dir}/{name}.parquet', engine="pyarrow")
+    return df
 
 
 # class ResidualBlock(tf.keras.Model):
@@ -717,11 +939,13 @@ class CustomNeuralReceiver(tf.keras.Model):
         # Input conv
         if self._training == False:
             padding_size = (-inputs.shape[1] % 48)
+            padded_input_size = inputs.shape[1]
             if(padding_size != 0):
-                padded_input_size = inputs.shape[1] + padding_size
+                padded_input_size = padded_input_size + padding_size
                 inputs = tf.concat([inputs, inputs[:,:padding_size,]],axis=1)
-                inputs = tf.reshape(inputs, [-1,48,14,16])
-        z = tf.linalg.l2_normalize(inputs, axis=[-1,-2,-3])
+            inputs = tf.reshape(inputs, [-1,48,14,18])
+        # z = tf.linalg.l2_normalize(inputs, axis=[-1,-2,-3])
+        z = inputs
         z = self._input_conv(z)
         # Residual blocks
         z = self._res_block_1(z)
@@ -732,8 +956,8 @@ class CustomNeuralReceiver(tf.keras.Model):
         z = self._output_conv(z)
 
         if self._training == False:
+            z = tf.reshape(z, [-1,padded_input_size,14,2])
             if padding_size != 0:
-                z = tf.reshape(z, [-1,padded_input_size,14,2])
                 z = z[:,:-(padding_size),]
 
 
@@ -741,3 +965,366 @@ class CustomNeuralReceiver(tf.keras.Model):
         z = tf.transpose(z, perm=[0,2,1,3])
         z = tf.reshape(z, [z.shape[0],(z.shape[1]*z.shape[2]*z.shape[3])])
         return z
+
+
+
+
+
+def setCfgReq(puschCfg: MyPUSCHConfig, slots, dir):
+    bandwidth = puschCfg.My_Config.Sys.BandWidth
+    fft_size = 4096
+    filename = os.path.join(dir, 'cfgReq.cfg')
+    
+    slot_config_template = "1,1,1,1,1,1,1,1,1,1,1,1,1,1"  # 14 ones
+    default_config_template = "2,2,2,2,2,2,2,2,2,2,2,2,2,2"  # 14 twos
+    
+    xml_content = """<?xml version="1.0"?>
+
+<TestConfig>
+	<numSlots>20</numSlots>
+"""
+    for i in range(NUM_RX_ANT):
+        xml_content += f"\t<uliq_car0_ant{i}>rx_ant_{i}.bin</uliq_car0_ant{i}>\n"
+    
+    xml_content += f"""	<ul_ref_out>ref.txt</ul_ref_out>
+	<start_frame_number>0</start_frame_number>
+	<start_slot_number>0</start_slot_number>
+</TestConfig>
+
+<ConfigReq>
+	<nCarrierIdx>0</nCarrierIdx>
+	<nDMRSTypeAPos>3</nDMRSTypeAPos>
+	<nPhyCellId>{puschCfg.carrier.n_cell_id}</nPhyCellId>
+	<nDLBandwidth>{bandwidth}</nDLBandwidth>
+	<nULBandwidth>{bandwidth}</nULBandwidth>
+	<nDLFftSize>{fft_size}</nDLFftSize>
+	<nULFftSize>{fft_size}</nULFftSize>
+	<nNrOfTxAnt>NUM_RX_ANT</nNrOfTxAnt>
+	<nNrOfRxAnt>NUM_RX_ANT</nNrOfRxAnt>
+	<nCarrierAggregationLevel>0</nCarrierAggregationLevel>
+	<nFrameDuplexType>1</nFrameDuplexType>
+	<nSubcCommon>1</nSubcCommon>
+	<nTddPeriod>20</nTddPeriod>
+"""
+    
+    for i in range(20):
+        config_value = slot_config_template if i in slots else default_config_template
+        xml_content += f"\t<sSlotConfig{i}>{config_value}</sSlotConfig{i}>\n"
+    
+    xml_content += "\t<nCyclicPrefix>0</nCyclicPrefix>\n</ConfigReq>\n\n<RxConfig>\n"
+    
+    for i in range(20):
+        slot_value = f"slot{i}.cfg" if i in slots else "null.cfg"
+        xml_content += f"\t<SlotNum{i}>{slot_value}</SlotNum{i}>\n"
+    
+    xml_content += """</RxConfig>
+"""
+    
+    with open(filename, 'w') as f:
+        f.write(xml_content)
+    
+    print(f"Config Request saved to {filename}")
+
+def setUlCfgReq(puschCfg: MyPUSCHConfig, harqIdx, dir):
+
+    filename = os.path.join(dir, f'slot{puschCfg.carrier.slot_number}.cfg')
+
+    # Define the XML structure dynamically
+    xml_content = f"""<?xml version="1.0"?>
+
+<Ul_Config_Req>
+
+	<UlConfigReqL1L2Header>
+		<nSFN>{puschCfg.carrier.frame_number}</nSFN>
+		<nSlot>{puschCfg.carrier.slot_number}</nSlot>
+		<nPDU>{1}</nPDU>
+		<nGroup>{1}</nGroup>
+		<nUlsch>{1}</nUlsch>
+		<nUlcch>{0}</nUlcch>
+		<nRachPresent>{0}</nRachPresent>
+	</UlConfigReqL1L2Header>
+
+	<UL_SCH_PDU0>
+		<nRNTI>{puschCfg.n_rnti}</nRNTI>
+		<nUEId>{0}</nUEId>
+		<nBWPSize>{puschCfg.n_size_bwp}</nBWPSize>
+		<nBWPStart>{puschCfg.n_start_bwp}</nBWPStart>
+		<nSubcSpacing>{puschCfg.carrier.mu}</nSubcSpacing>
+		<nCpType>{puschCfg.My_Config.Sys.CpType}</nCpType>
+		<nULType>{0}</nULType>
+		<nMcsTable>{puschCfg.tb.mcs_table - 1}</nMcsTable>
+		<nMCS>{puschCfg.tb.mcs_index}</nMCS>
+		<nTransPrecode>{puschCfg.My_Config.Ue[0].TransformPrecoding}</nTransPrecode>
+		<nTransmissionScheme>{puschCfg.My_Config.Ue[0].CodeBookBased}</nTransmissionScheme>
+		<nNrOfLayers>{puschCfg.num_layers}</nNrOfLayers>
+		<nPortIndex0>{puschCfg.dmrs.dmrs_port_set[0]}</nPortIndex0>
+		<nNid>{puschCfg.tb.n_id}</nNid>
+		<nSCID>{puschCfg.dmrs.n_scid}</nSCID>
+		<nNIDnSCID>{puschCfg.dmrs.n_id[0]}</nNIDnSCID>
+		<nNrOfAntennaPorts>{puschCfg.My_Config.Sys.NRxAnt}</nNrOfAntennaPorts>
+		<nVRBtoPRB>{0}</nVRBtoPRB>
+		<nPMI>{puschCfg.My_Config.Ue[0].Tpmi}</nPMI>
+		<nStartSymbolIndex>{puschCfg.symbol_allocation[0]}</nStartSymbolIndex>
+		<nNrOfSymbols>{puschCfg.symbol_allocation[1]}</nNrOfSymbols>
+		<nResourceAllocType>{1}</nResourceAllocType>
+		<nRBStart>{puschCfg.first_resource_block}</nRBStart>
+		<nRBSize>{puschCfg.num_resource_blocks}</nRBSize>
+		<nTBSize>{(puschCfg.tb_size//8)}</nTBSize>
+		<nRV>{puschCfg.My_Config.Sys.rvSeq}</nRV>
+		<nHARQID>{harqIdx}</nHARQID>
+		<nNDI>{1}</nNDI>
+		<nMappingType>{puschCfg.My_Config.Ue[0].PuschMappingType}</nMappingType>
+		<nDMRSConfigType>{puschCfg.My_Config.Ue[0].DmrsConfigurationType}</nDMRSConfigType>
+		<nNrOfCDMs>{puschCfg.dmrs.num_cdm_groups_without_data}</nNrOfCDMs>
+		<nNrOfDMRSSymbols>{puschCfg.dmrs.length}</nNrOfDMRSSymbols>
+		<nDMRSAddPos>{puschCfg.dmrs.additional_position}</nDMRSAddPos>
+		<nPTRSPresent>{puschCfg.My_Config.Ue[0].Ptrs}</nPTRSPresent>
+		<nAck>{puschCfg.My_Config.Ue[0].OAck}</nAck>
+		<nAlphaScaling>{puschCfg.My_Config.Ue[0].ScalingFactor}</nAlphaScaling>
+		<nBetaOffsetACKIndex>{puschCfg.My_Config.Ue[0].IHarqAckOffset}</nBetaOffsetACKIndex>
+		<nCsiPart1>{puschCfg.My_Config.Ue[0].OCsi1}</nCsiPart1>
+		<nBetaOffsetCsiPart1Index>{puschCfg.My_Config.Ue[0].ICsi1Offset}</nBetaOffsetCsiPart1Index>
+		<nCsiPart2>{puschCfg.My_Config.Ue[0].OCsi2}</nCsiPart2>
+		<nBetaOffsetCsiPart2Index>{puschCfg.My_Config.Ue[0].ICsi2Offset}</nBetaOffsetCsiPart2Index>
+		<nTpPi2BPSK>{puschCfg.My_Config.Ue[0].TpPi2Bpsk}</nTpPi2BPSK>
+		<nTPPuschID>{puschCfg.My_Config.Ue[0].NRsId}</nTPPuschID>
+		<nRxRUIdx0>{0}</nRxRUIdx0>
+		<nRxRUIdx1>{1}</nRxRUIdx1>
+		<nRxRUIdx2>{2}</nRxRUIdx2>
+		<nRxRUIdx3>{3}</nRxRUIdx3>
+		<nRxRUIdx4>{4}</nRxRUIdx4>
+		<nRxRUIdx5>{5}</nRxRUIdx5>
+		<nRxRUIdx6>{6}</nRxRUIdx6>
+		<nRxRUIdx7>{7}</nRxRUIdx7>
+	</UL_SCH_PDU0>
+
+	<PUSCH_GROUP_INFO0>
+		<nUE>{1}</nUE>
+		<nPduIdx0>{0}</nPduIdx0>
+	</PUSCH_GROUP_INFO0>
+
+</Ul_Config_Req>
+"""
+    with open(filename, 'w') as file:
+        file.write(xml_content)
+    print(f"UL Config Request Slot {puschCfg.carrier.slot_number} saved to {filename}")
+
+def set_null(dir):
+    filename = os.path.join(dir, 'null.cfg')
+
+    xml_content = f"""<?xml version="1.0"?>
+
+<Ul_Config_Req>
+	<UlConfigReqL1L2Header>
+		<nSFN>0</nSFN>
+		<nSlot>0</nSlot>
+		<nPDU>0</nPDU>
+		<nGroup>0</nGroup>
+		<nUlsch>0</nUlsch>
+		<nUlcch>0</nUlcch>
+		<nRachPresent>0</nRachPresent>
+	</UlConfigReqL1L2Header>
+</Ul_Config_Req>
+"""
+    with open(filename, 'w') as file:
+        file.write(xml_content)
+    print(f"Null Config saved to {filename}")
+    
+def setRxData(rxSigFreq, dir):
+    # rxSigFreq = tf.reshape(rxSigFreq, -1)
+    rxSigFreq = tf.stack((tf.math.real(rxSigFreq), tf.math.imag(rxSigFreq)), axis=-1)
+    
+    rxSigFreq = rxSigFreq/tf.math.reduce_max(tf.abs(rxSigFreq))
+
+    rxSigFreq = tf.cast(tf.round(rxSigFreq*2**13), tf.int16)
+    rxSigFreq = tf.reshape(rxSigFreq,[NUM_RX_ANT,-1])
+    
+    for rxIdx in range(NUM_RX_ANT):
+        file_path = os.path.join(dir, f'rx_ant_{rxIdx}.bin')
+        with open(file_path, 'wb') as file:
+            file.write(rxSigFreq[rxIdx])
+    return rxSigFreq
+
+
+
+def setRef(inBits, dir):
+    filename = os.path.join(dir, 'ref.txt')
+    with open(filename, 'w') as file:
+        file.write(f'##----------------------------------------------------------------------------\n')
+    return 
+    
+    # with open(filename, 'w') as file:
+    #     file.write(f'##----------------------------------------------------------------------------\n')
+    #     fn = -1
+    #     for n,payload in enumerate(inBits):
+    #         # payload = inBits[:, i]
+    #         if n in [4,5,14,15]:
+    #             fn = fn + 1
+    #             tbSize = payload.shape[-1]//8
+    #             file.write(f'#type[PUSCH] fn[{fn}] slot[{n}] sym[0] carrier[0] chanId[0] len[{tbSize}]\n')
+    #             file.write(f'\t  #ta[0] cqi[0.0] stat[1]\n')
+    #             file.write(f'\t  #data[\n')
+    #             Q = tbSize//64
+    #             payload = tf.math.reduce_sum(tf.reshape(payload,[-1, 8]) * tf.constant([[128, 64, 32, 16, 8, 4, 2, 1]], dtype=tf.uint8), axis=1)
+    #             # print(payload.shape, Q, r)
+    #             for q in range(Q):
+    #                 file.write('\t        ')
+    #                 for r in range(64):
+    #                     file.write(f'{payload[64*q + r]:3d}, ')
+    #                 file.write('\n')
+    #             file.write('\t        ')
+    #             for r in range(tbSize%64-1):
+    #                 file.write(f'{payload[64*Q + r]:3d}, ')
+    #             file.write(f'{payload[-1]:3d}\n')
+    #             file.write(f'\t       ]\n')
+    #             file.write(f'------------------------------------------------------------------------------\n')
+    #         else: 
+    #             file.write(f'##----------------------------------------------------------------------------\n')
+
+
+
+
+"""Predict and loss function"""
+def loss_cal(pred, labels):
+  bce = tf.nn.sigmoid_cross_entropy_with_logits(labels, pred)
+  bce = tf.reduce_mean(bce)
+  loss = bce
+  return loss
+
+def compute_ber(b, b_hat):
+    """Computes the bit error rate (BER) between two binary tensors.
+
+    Input
+    -----
+        b : tf.float32
+            A tensor of arbitrary shape filled with ones and
+            zeros.
+
+        b_hat : tf.float32
+            A tensor of the same shape as ``b`` filled with
+            ones and zeros.
+
+    Output
+    ------
+        : tf.float64
+            A scalar, the BER.
+    """
+    ber = tf.not_equal(b, b_hat)
+    ber = tf.cast(ber, tf.float64) # tf.float64 to suport large batch-sizes
+    return tf.reduce_mean(ber)
+
+def predict(model, y, r):
+    assert len(y.shape) == len(y.shape)  == 5, "y,r shape should be [batch_size, num_tx/rx, num_antennas, num_ofdm_symbols, num_subcarriers]"
+    assert y.shape[1] == r.shape[1] == 1, "num_tx/rx should be 1"
+    
+    def preproc(tensor):
+        tensor = tensor[:,0]
+        tensor = tf.transpose(tensor, [0, 3,2,1])
+        tensor = tf.concat([tf.math.real(tensor), tf.math.imag(tensor)], axis=-1)
+        return tensor
+    y = preproc(y)
+    y = (y - tf.math.reduce_mean(y, axis=[-1,-2,-3,-4], keepdims=True))/(tf.math.reduce_std(y, axis=[-1,-2,-3,-4], keepdims=True))
+
+    r = preproc(r)
+
+    inputs = tf.concat([y, r], axis=-1)
+    preds = model(inputs)
+    return preds
+
+def data_reader(file_path, shape=[8,14,-1]):
+    """Reads complex int16 data from a binary file."""
+    freq = []
+    with open(file_path, 'rb') as file:
+        binary_data = file.read()
+        for i in range(0, len(binary_data), 4):
+            real = binary_data[i:i+2]
+            imag = binary_data[i+2:i+4]
+            if len(real) == 2:
+                real_part = struct.unpack('<h', real)[0]
+                imag_part = struct.unpack('<h', imag)[0]
+                freq.append(complex(real_part, imag_part))
+    return np.array(freq, dtype=np.complex64).reshape(shape)  # Use np.complex64 for efficient storage (8 ant x 14 Sym x Num subcarrier)
+
+def data_writer(file_path, data):
+    """Writes complex int16 data into a binary file."""
+    data = data.flatten()
+    with open(file_path, 'wb') as file:
+        for value in data:
+            real_part = struct.pack('<h', int(value.real))
+            imag_part = struct.pack('<h', int(value.imag))
+            file.write(real_part + imag_part)
+
+
+
+def pusch_config_from_pd_row(pd_row: pd.Series) -> MyConfig:
+    sysCfg = SystemConfig(
+        NCellId=int(pd_row.nPhyCellId),
+        CpType=int(pd_row.nCpType),
+        BwpNRb=int(pd_row.nBWPSize),
+        BwpRbOffset=int(pd_row.nBWPStart)
+    )
+    ueCfg = UeConfig(
+        TransformPrecoding=int(pd_row.nTransPrecode),
+        Rnti=int(pd_row.nRNTI),
+        nId=int(pd_row.nNid),
+        NLayers=int(pd_row.nNrOfLayers),
+        FirstSymb=int(pd_row.nStartSymbolIndex),
+        NPuschSymbAll=int(pd_row.nNrOfSymbols),
+        FirstPrb=int(pd_row.nRBStart),
+        NPrb=int(pd_row.nRBSize),
+        McsTable=int(pd_row.nMcsTable),
+        Mcs=int(pd_row.nMCS),
+        nScId=int(pd_row.nSCID),
+        NnScIdId=int(pd_row.nNIDnSCID),
+        DmrsConfigurationType=int(pd_row.nDMRSConfigType),
+        DmrsDuration=int(pd_row.nNrOfDMRSSymbols),
+        DmrsAdditionalPosition=int(pd_row.nDMRSAddPos),
+        PuschMappingType=int(pd_row.nMappingType),
+        DmrsTypeAPosition=int(pd_row.nDMRSTypeAPos),
+        Ptrs=int(pd_row.nPTRSPresent),
+        OAck=int(pd_row.nAck),
+        OCsi1=int(pd_row.nCsiPart1),
+        OCsi2=int(pd_row.nCsiPart2),
+        TpPi2Bpsk=int(pd_row.nTpPi2BPSK)
+    )
+    myCfg = MyConfig(sysCfg, [ueCfg])
+    puschCfg = MyPUSCHConfig(myCfg)
+    return puschCfg
+
+def get_unique_configs(df: pd.DataFrame):
+    Pusch_used_Cols = ['nPhyCellId', 'nCpType', 'nSubcSpacing', 'nBWPSize', 'nBWPStart', 'nSlot',
+    'nDMRSConfigType', 'nNrOfDMRSSymbols', 'nDMRSAddPos', 'nPortIndex', 'nNIDnSCID', 'nSCID', 'nNrOfCDMs', 'nDMRSTypeAPos',
+    'nNid', 'nMcsTable', 'nMCS',
+    'nMappingType', 'nNrOfLayers', 'nTransmissionScheme', 'nPMI', 'nTransPrecode', 'nRNTI',
+    'nStartSymbolIndex', 'nNrOfSymbols', 'nRBStart', 'nRBSize',
+    'nPTRSPresent', 'nAck', 'nCsiPart1', 'nCsiPart2', 'nTpPi2BPSK']
+
+    df_copy = df[Pusch_used_Cols].copy()
+    for col in df_copy.columns:
+        if isinstance(df_copy[col].iloc[0], np.ndarray):  # Check first element type
+            df_copy[col] = df_copy[col].apply(lambda x: tuple(x) if isinstance(x, np.ndarray) else x)
+
+    return df_copy.reset_index().groupby(list(df_copy.columns)).agg(indices=('index',list)).reset_index()
+
+
+def data_loader(df, dir, saved_dataset='hdf5'):
+    assert saved_dataset in ['hdf5', 'pickle'], "saved data set should be 'pickle' or 'hdf5'."
+    assert 'index' in df.columns, "DataFrame must contain a column named 'index'. Reading parquet should be 'df = pd.read_parquet(...).reset_index()'"
+    for pusch_record in df.itertuples():
+        data_filename = pusch_record.Data_filename
+        data_dirname = pusch_record.Data_dirname
+        esno_db = pusch_record.Esno_db
+        index = pusch_record.index
+        if saved_dataset == 'hdf5':
+            b,c,y, r = load_hdf5(f'{dir}/{data_dirname}', data_filename)
+        else:
+            b,c,y, r = load_pickle(f'{dir}/{data_dirname}', data_filename)
+        yield index, esno_db, c, y, b, r
+
+def preprocessing(index, esno_db, c, y, b, r):
+    y = tf.concat([tf.math.real(y), tf.math.imag(y)], axis = 0)
+    y = tf.transpose(y, perm=[2,1,0])
+    y = (y - tf.reduce_mean(y)) / tf.math.reduce_std(y)
+    r = tf.concat([tf.math.real(r), tf.math.imag(r)], axis = 0)
+    r = tf.transpose(r, perm=[2,1,0])
+    return index, esno_db, c, y, b, r
