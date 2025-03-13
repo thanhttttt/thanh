@@ -28,7 +28,7 @@ from tensorflow.nn import relu
 
 from collections import namedtuple
 
-sionna.config.xla_compat=True
+# sionna.config.xla_compat=True
 
 CARRIER_FREQUENCY = 2.55e9
 BANDWIDTH = 60
@@ -352,7 +352,7 @@ class MySimulator():
         self.Resource_Grid_Mapper._resource_grid.pilot_pattern.pilots = pilots
         """Channel Estimationand Detection will reflect this update since they reference the same object."""
 
-    @tf.function(jit_compile=True)
+    @tf.function()
     def sim(self, batch_size, channel_model, no_scaling, gen_prng_seq=None, return_tx_iq=False, return_channel=False):
         if gen_prng_seq:
             b = tf.reshape(tf.constant(generate_prng_seq(batch_size * NUM_TX * self.tb_size, gen_prng_seq), dtype=tf.float32), [batch_size, NUM_TX, self.tb_size])
