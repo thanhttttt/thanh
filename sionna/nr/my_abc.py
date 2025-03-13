@@ -21,6 +21,7 @@ import h5py
 import os
 import time
 import struct
+import re
 
 from tensorflow.keras.layers import Layer, Conv2D, LayerNormalization, SeparableConv2D
 from tensorflow.nn import relu
@@ -832,13 +833,7 @@ class CustomNeuralReceiver(tf.keras.Model):
 
     def call(self, inputs):
         # Input conv
-        if self._training == False:
-            padding_size = (-inputs.shape[1] % 48)
-            padded_input_size = inputs.shape[1]
-            if(padding_size != 0):
-                padded_input_size = padded_input_size + padding_size
-                inputs = tf.concat([inputs, inputs[:,:padding_size,]],axis=1)
-            inputs = tf.reshape(inputs, [-1,48,14,18])
+      
 
         z = inputs
         z = self._input_conv(z)
@@ -850,15 +845,6 @@ class CustomNeuralReceiver(tf.keras.Model):
         # Output conv
         z = self._output_conv(z)
 
-        if self._training == False:
-            z = tf.reshape(z, [-1,padded_input_size,14,2])
-            if padding_size != 0:
-                z = z[:,:-(padding_size),]
-
-
-        z = tf.concat([z[...,0:3,:],z[...,4:11,:], z[...,12:14,:]],axis=-2)
-        z = tf.transpose(z, perm=[0,2,1,3])
-        z = tf.reshape(z, [-1,(z.shape[1]*z.shape[2]*z.shape[3])])
         return z
 
 
@@ -1123,7 +1109,26 @@ def predict(model, y, r):
     r = preproc(r)
 
     inputs = tf.concat([y, r], axis=-1)
+    
+    padding_size = (-inputs.shape[1] % 48)
+    padded_input_size = inputs.shape[1]
+    if(padding_size != 0):
+        padded_input_size = padded_input_size + padding_size
+        inputs = tf.concat([inputs, inputs[:,:padding_size,]],axis=1)
+    inputs = tf.reshape(inputs, [-1,48,14,18])
+
+
     preds = model(inputs)
+    
+    preds = tf.reshape(preds, [-1,padded_input_size,14,2])
+    if padding_size != 0:
+        preds = preds[:,:-(padding_size),]
+
+
+    preds = tf.concat([preds[...,0:3,:],preds[...,4:11,:], preds[...,12:14,:]],axis=-2)
+    preds = tf.transpose(preds, perm=[0,2,1,3])
+    preds = tf.reshape(preds, [-1,(preds.shape[1]*preds.shape[2]*preds.shape[3])])
+    
     return preds
 
 def data_reader(file_path, shape=[8,14,-1]):
