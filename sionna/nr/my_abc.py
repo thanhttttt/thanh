@@ -3,7 +3,7 @@ from typing import List
 from sionna.nr.utils import generate_prng_seq
 from sionna.nr import PUSCHConfig, CarrierConfig, PUSCHDMRSConfig, TBConfig, PUSCHPilotPattern, TBEncoder,LayerMapper, LayerDemapper, TBDecoder, PUSCHLSChannelEstimator
 from sionna.channel import AWGN, OFDMChannel, gen_single_sector_topology as gen_topology
-from sionna.ofdm import LinearDetector, ResourceGrid, ResourceGridMapper
+from sionna.ofdm import LinearDetector, ResourceGrid, ResourceGridMapper, LMMSEInterpolator, MaximumLikelihoodDetector, KBestDetector
 from sionna.mimo import StreamManagement
 from sionna.mapping import Mapper
 from sionna.utils import BinarySource
@@ -22,6 +22,7 @@ import os
 import time
 import struct
 import re
+import math
 
 from tensorflow.keras.layers import Layer, Conv2D, LayerNormalization, SeparableConv2D
 from tensorflow.nn import relu
@@ -390,8 +391,23 @@ class MySimulator():
         b_hat, tb_crc_status = self.TB_Decode(llr_layer)
 
         return h_hat, x_hat, llr_det, b_hat, tb_crc_status
-    
-    def per(self, y, h, no):
+    # def build_per(self, cov_mat_time, cov_mat_freq, cov_mat_space=None, order='t-f'):
+
+    #     self.LMMSE_Channel_Estimator = PUSCHLSChannelEstimator(
+    #             self.Resource_Grid_Mapper.resource_grid,
+    #             self.pusch_config.dmrs.length,
+    #             self.pusch_config.dmrs.additional_position,
+    #             self.pusch_config.dmrs.num_cdm_groups_without_data,
+    #             interpolator=LMMSEInterpolator(
+    #                 pilot_pattern=self.Resource_Grid_Mapper._resource_grid.pilot_pattern,
+    #                 cov_mat_time=cov_mat_time,
+    #                 cov_mat_freq=cov_mat_freq,
+    #                 cov_mat_space=cov_mat_space,
+    #                 order=order                            
+    #                 ),
+    #             dtype=tf.complex64)
+
+    def per(self, y, h, no):       
         h_hat, err_var = h, 0.
         x_hat = self.Equalizer([y, h_hat, err_var, no])
         llr_det = self.Mimo_Detector([y, h_hat, err_var, no])
@@ -500,10 +516,11 @@ def generate_data(name: str,
                 for n,slot in enumerate(slots):
                     status_str = f"(config {config_idx} | channel {channel_scenario} | {esno_db} dB | slot {slot} | Sample: {n+1}/{len_per_case}"
                     pbar.set_description(status_str)
+                    simulator.pusch_config.carrier.frame_number = (n // len_pusch) % 1023
                     simulator.pusch_config.carrier.slot_number = slot
                     simulator.update_pilots(Pusch_Pilots[slot])
                     
-                    b, c, y= simulator.sim(1, channel_i, no_scaling, return_channel=False)
+                    b, c, y = simulator.sim(1, channel_i, no_scaling, return_channel=False)
 
                     assert b.shape[0] == b.shape[1] == c.shape[0] == c.shape[1] == y.shape[0] == y.shape[1] == 1
                     b = tf.cast(b, dtype=tf.uint8)[0][0]
@@ -523,59 +540,59 @@ def generate_data(name: str,
                     
                     
                     pusch_records.append(PuschRecord(
-                                        nPhyCellId=pusch_config.carrier.n_cell_id,
+                                        nPhyCellId=simulator.pusch_config.carrier.n_cell_id,
                                         nSFN=(n // len_pusch) % 1023,
-                                        nSlot=slot,
+                                        nSlot=simulator.pusch_config.carrier.slot_number,
                                         nPDU=1,
                                         nGroup=1,
                                         nUlsch=1,
                                         nUlcch=0,
                                         nRachPresent=0,
-                                        nRNTI=pusch_config.n_rnti,
+                                        nRNTI=simulator.pusch_config.n_rnti,
                                         nUEId=0,
-                                        nBWPSize=pusch_config.n_size_bwp,
-                                        nBWPStart=pusch_config.n_start_bwp,
-                                        nSubcSpacing=pusch_config.carrier.mu,
-                                        nCpType=pusch_config.My_Config.Sys.CpType,
+                                        nBWPSize=simulator.pusch_config.n_size_bwp,
+                                        nBWPStart=simulator.pusch_config.n_start_bwp,
+                                        nSubcSpacing=simulator.pusch_config.carrier.mu,
+                                        nCpType=simulator.pusch_config.My_Config.Sys.CpType,
                                         nULType=0,
-                                        nMcsTable=pusch_config.tb.mcs_table - 1,
-                                        nMCS=pusch_config.tb.mcs_index,
-                                        nTransPrecode=pusch_config.My_Config.Ue[0].TransformPrecoding,
-                                        nTransmissionScheme=pusch_config.My_Config.Ue[0].CodeBookBased,
-                                        nNrOfLayers=pusch_config.num_layers,
-                                        nPortIndex=pusch_config.dmrs.dmrs_port_set,
-                                        nNid=pusch_config.tb.n_id,
-                                        nSCID=pusch_config.dmrs.n_scid,
-                                        nNIDnSCID=pusch_config.dmrs.n_id[0],
-                                        nNrOfAntennaPorts=pusch_config.My_Config.Sys.NRxAnt,
+                                        nMcsTable=simulator.pusch_config.tb.mcs_table - 1,
+                                        nMCS=simulator.pusch_config.tb.mcs_index,
+                                        nTransPrecode=simulator.pusch_config.My_Config.Ue[0].TransformPrecoding,
+                                        nTransmissionScheme=simulator.pusch_config.My_Config.Ue[0].CodeBookBased,
+                                        nNrOfLayers=simulator.pusch_config.num_layers,
+                                        nPortIndex=simulator.pusch_config.dmrs.dmrs_port_set,
+                                        nNid=simulator.pusch_config.tb.n_id,
+                                        nSCID=simulator.pusch_config.dmrs.n_scid,
+                                        nNIDnSCID=simulator.pusch_config.dmrs.n_id[0],
+                                        nNrOfAntennaPorts=simulator.pusch_config.My_Config.Sys.NRxAnt,
                                         nVRBtoPRB=0,
-                                        nPMI=pusch_config.My_Config.Ue[0].Tpmi,
-                                        nStartSymbolIndex=pusch_config.symbol_allocation[0],
-                                        nNrOfSymbols=pusch_config.symbol_allocation[1],
+                                        nPMI=simulator.pusch_config.My_Config.Ue[0].Tpmi,
+                                        nStartSymbolIndex=simulator.pusch_config.symbol_allocation[0],
+                                        nNrOfSymbols=simulator.pusch_config.symbol_allocation[1],
                                         nResourceAllocType=1,
-                                        nDMRSTypeAPos=pusch_config.dmrs.type_a_position,
-                                        nRBStart=pusch_config.first_resource_block,
-                                        nRBSize=pusch_config.num_resource_blocks,
-                                        nTBSize=(pusch_config.tb_size//8),
-                                        nRV=pusch_config.My_Config.Sys.rvSeq,
+                                        nDMRSTypeAPos=simulator.pusch_config.dmrs.type_a_position,
+                                        nRBStart=simulator.pusch_config.first_resource_block,
+                                        nRBSize=simulator.pusch_config.num_resource_blocks,
+                                        nTBSize=(simulator.pusch_config.tb_size//8),
+                                        nRV=simulator.pusch_config.My_Config.Sys.rvSeq,
                                         nHARQID=n % 16,
                                         nNDI=1,
-                                        nMappingType=pusch_config.My_Config.Ue[0].PuschMappingType,
-                                        nDMRSConfigType=pusch_config.My_Config.Ue[0].DmrsConfigurationType,
-                                        nNrOfCDMs=pusch_config.dmrs.num_cdm_groups_without_data,
-                                        nNrOfDMRSSymbols=pusch_config.dmrs.length,
-                                        nDMRSAddPos=pusch_config.dmrs.additional_position,
-                                        nPTRSPresent=pusch_config.My_Config.Ue[0].Ptrs,
-                                        nAck=pusch_config.My_Config.Ue[0].OAck,
-                                        nAlphaScaling=pusch_config.My_Config.Ue[0].ScalingFactor,
-                                        nBetaOffsetACKIndex=pusch_config.My_Config.Ue[0].IHarqAckOffset,
-                                        nCsiPart1=pusch_config.My_Config.Ue[0].OCsi1,
-                                        nBetaOffsetCsiPart1Index=pusch_config.My_Config.Ue[0].ICsi1Offset,
-                                        nCsiPart2=pusch_config.My_Config.Ue[0].OCsi2,
-                                        nBetaOffsetCsiPart2Index=pusch_config.My_Config.Ue[0].ICsi2Offset,
-                                        nTpPi2BPSK=pusch_config.My_Config.Ue[0].TpPi2Bpsk,
-                                        nTPPuschID=pusch_config.My_Config.Ue[0].NRsId,
-                                        nRxRUIdx=np.arange(0, pusch_config.My_Config.Sys.NRxAnt),
+                                        nMappingType=simulator.pusch_config.My_Config.Ue[0].PuschMappingType,
+                                        nDMRSConfigType=simulator.pusch_config.My_Config.Ue[0].DmrsConfigurationType,
+                                        nNrOfCDMs=simulator.pusch_config.dmrs.num_cdm_groups_without_data,
+                                        nNrOfDMRSSymbols=simulator.pusch_config.dmrs.length,
+                                        nDMRSAddPos=simulator.pusch_config.dmrs.additional_position,
+                                        nPTRSPresent=simulator.pusch_config.My_Config.Ue[0].Ptrs,
+                                        nAck=simulator.pusch_config.My_Config.Ue[0].OAck,
+                                        nAlphaScaling=simulator.pusch_config.My_Config.Ue[0].ScalingFactor,
+                                        nBetaOffsetACKIndex=simulator.pusch_config.My_Config.Ue[0].IHarqAckOffset,
+                                        nCsiPart1=simulator.pusch_config.My_Config.Ue[0].OCsi1,
+                                        nBetaOffsetCsiPart1Index=simulator.pusch_config.My_Config.Ue[0].ICsi1Offset,
+                                        nCsiPart2=simulator.pusch_config.My_Config.Ue[0].OCsi2,
+                                        nBetaOffsetCsiPart2Index=simulator.pusch_config.My_Config.Ue[0].ICsi2Offset,
+                                        nTpPi2BPSK=simulator.pusch_config.My_Config.Ue[0].TpPi2Bpsk,
+                                        nTPPuschID=simulator.pusch_config.My_Config.Ue[0].NRsId,
+                                        nRxRUIdx=np.arange(0, simulator.pusch_config.My_Config.Sys.NRxAnt),
                                         nUE=1,
                                         nPduIdx=[0],
                                         Channel_model=f"{channel}-{model}",
@@ -603,10 +620,6 @@ def load_weights(model, pretrained_weights_path):
         print(f"Loaded pretrained weights from {pretrained_weights_path}")
 
 
-
-
-import re
-import math
 
 def bitmask_to_indices(bitmask):
     indices = []
@@ -1096,6 +1109,7 @@ def compute_ber(b, b_hat):
     ber = tf.cast(ber, tf.float64) # tf.float64 to suport large batch-sizes
     return tf.reduce_mean(ber)
 
+@tf.function(jit_compile=True)
 def predict(model, y, r):
     assert len(y.shape) == len(y.shape)  == 5, "y,r shape should be [batch_size, num_tx/rx, num_antennas, num_ofdm_symbols, num_subcarriers]"
     assert y.shape[1] == r.shape[1] == 1, "num_tx/rx should be 1"
