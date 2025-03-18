@@ -541,7 +541,7 @@ def generate_data(name: str,
                     
                     pusch_records.append(PuschRecord(
                                         nPhyCellId=simulator.pusch_config.carrier.n_cell_id,
-                                        nSFN=(n // len_pusch) % 1023,
+                                        nSFN=simulator.pusch_config.carrier.frame_number,
                                         nSlot=simulator.pusch_config.carrier.slot_number,
                                         nPDU=1,
                                         nGroup=1,
