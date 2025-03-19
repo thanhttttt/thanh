@@ -343,7 +343,7 @@ class MySimulator():
                                     "qam", pusch_config.tb.num_bits_per_symbol, dtype=tf.complex64)
 
         self.Layer_Demapper = LayerDemapper(self.Layer_Mapper, num_bits_per_symbol=num_bits_per_symbol)
-        self.TB_Decode = TBDecoder(self.TB_Encoder, output_dtype=tf.float32)
+        self.TB_Decoder = TBDecoder(self.TB_Encoder, output_dtype=tf.float32)
 
         self.tb_size = tb_size
         self.resource_grid = resource_grid
@@ -388,7 +388,7 @@ class MySimulator():
         x_hat = self.Equalizer([y, h_hat, err_var, no_])
         llr_det = self.Mimo_Detector([y, h_hat, err_var, no_])
         llr_layer = self.Layer_Demapper(llr_det)
-        b_hat, tb_crc_status = self.TB_Decode(llr_layer)
+        b_hat, tb_crc_status = self.TB_Decoder(llr_layer)
 
         return h_hat, x_hat, llr_det, b_hat, tb_crc_status
     # def build_per(self, cov_mat_time, cov_mat_freq, cov_mat_space=None, order='t-f'):
@@ -412,7 +412,7 @@ class MySimulator():
         x_hat = self.Equalizer([y, h_hat, err_var, no])
         llr_det = self.Mimo_Detector([y, h_hat, err_var, no])
         llr_layer = self.Layer_Demapper(llr_det)
-        b_hat, tb_crc_status = self.TB_Decode(llr_layer)
+        b_hat, tb_crc_status = self.TB_Decoder(llr_layer)
 
         return h_hat, x_hat, llr_det, b_hat, tb_crc_status
 
@@ -1232,15 +1232,15 @@ def data_loader(df, dir, saved_dataset='hdf5'):
         esno_db = pusch_record.Esno_db
         index = pusch_record.index
         if saved_dataset == 'hdf5':
-            b,c,y, r = load_hdf5(f'{dir}/{data_dirname}', data_filename)
+            _,c,y, r = load_hdf5(f'{dir}/{data_dirname}', data_filename)
         else:
-            b,c,y, r = load_pickle(f'{dir}/{data_dirname}', data_filename)
-        yield index, esno_db, c, y, b, r
+            _,c,y, r = load_pickle(f'{dir}/{data_dirname}', data_filename)
+        yield index, esno_db, c, y, r
 
-def preprocessing(index, esno_db, c, y, b, r):
+def preprocessing(index, esno_db, c, y, r):
     y = tf.concat([tf.math.real(y), tf.math.imag(y)], axis = 0)
     y = tf.transpose(y, perm=[2,1,0])
     y = (y - tf.reduce_mean(y)) / tf.math.reduce_std(y)
     r = tf.concat([tf.math.real(r), tf.math.imag(r)], axis = 0)
     r = tf.transpose(r, perm=[2,1,0])
-    return index, esno_db, c, y, b, r
+    return index, esno_db, c, y, r
