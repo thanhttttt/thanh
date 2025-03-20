@@ -1244,3 +1244,11 @@ def preprocessing(index, esno_db, c, y, r):
     r = tf.concat([tf.math.real(r), tf.math.imag(r)], axis = 0)
     r = tf.transpose(r, perm=[2,1,0])
     return index, esno_db, c, y, r
+
+def poly_hash(arr, base=31, mod=1_000_000_007):
+    arr = np.reshape(arr, [-1, arr.shape[-1]])
+    hash_val = [0]*arr.shape[0]
+    for n in range(arr.shape[0]):
+        for num in arr[n]:
+            hash_val[n] = (hash_val[n] * base + num) % mod
+    return hash_val
